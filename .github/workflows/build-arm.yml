@@ -1,0 +1,160 @@
+
+name: Build fnOS IPTV ARM
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - "manifest"
+      - "app/**"
+      - "app.tgz"
+      - "cmd/**"
+      - "config/**"
+      - "ICON.PNG"
+      - "icon_256.png"
+      - "README.md"
+      - ".github/workflows/build-arm.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm:
+    name: Build ARM FPK
+    runs-on: ubuntu-22.04
+
+    env:
+      FNPACK_VERSION: "1.2.3"
+      APP_NAME: "fnnas.iptv"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Check source files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f manifest
+          test -d app
+          test -d app/ui
+          test -d cmd
+          test -d config
+          test -f app.tgz
+          test -f ICON.PNG
+
+          grep -q 'appname="fnnas.iptv"' manifest
+          grep -q 'version="2.1.3"' manifest
+
+          # Verify the committed application archive is readable.
+          tar -tzf app.tgz >/dev/null
+
+          # Verify required configuration files before packaging.
+          test -f config/privilege
+          test -f config/resource
+
+          echo "Source preflight passed."
+
+      - name: Download fnpack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+
+          curl --fail --location --silent --show-error \
+            "$URL" \
+            --output "$RUNNER_TEMP/fnpack"
+
+          chmod 755 "$RUNNER_TEMP/fnpack"
+
+          "$RUNNER_TEMP/fnpack" --help
+          echo "FNPACK=$RUNNER_TEMP/fnpack" >> "$GITHUB_ENV"
+
+      - name: Prepare ARM package directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STAGE="$RUNNER_TEMP/fnos-iptv-arm"
+          mkdir -p "$STAGE"
+
+          # Copy tracked source files without modifying the checkout.
+          git archive HEAD | tar -x -C "$STAGE"
+
+          # Normalize the icon filename for the packager.
+          if [ ! -f "$STAGE/ICON_256.PNG" ]; then
+            if [ -f "$STAGE/icon_256.png" ]; then
+              cp "$STAGE/icon_256.png" "$STAGE/ICON_256.PNG"
+            else
+              echo "::error::Missing 256px application icon."
+              exit 1
+            fi
+          fi
+
+          # Create the standard wizard directory if absent.
+          mkdir -p "$STAGE/wizard"
+
+          # Change only the staged manifest.
+          sed -i \
+            's/^platform="all"$/platform="arm"/' \
+            "$STAGE/manifest"
+
+          grep -q '^platform="arm"$' "$STAGE/manifest"
+
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Build FPK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$STAGE"
+          "$FNPACK" build
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+
+          shopt -s nullglob
+          packages=("$STAGE"/*.fpk)
+
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::fnpack completed without producing an FPK."
+            exit 1
+          fi
+
+          version=$(sed -n \
+            's/^version="\([^"]*\)".*/\1/p' manifest | head -n 1)
+
+          test -n "$version"
+
+          cp "${packages[0]}" \
+            "$GITHUB_WORKSPACE/dist/fnos-iptv-${version}-arm64.fpk"
+
+      - name: Verify package and generate checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FPK=$(find dist -maxdepth 1 \
+            -type f -name '*.fpk' -print -quit)
+
+          test -n "$FPK"
+          test -s "$FPK"
+
+          sha256sum "$FPK" | tee "$FPK.sha256"
+
+          echo "Build output:"
+          ls -lh dist/
+
+      - name: Upload ARM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnos-iptv-arm64
+          path: |
+            dist/*.fpk
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
